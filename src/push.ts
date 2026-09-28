@@ -1054,13 +1054,18 @@ async function pushCore(
     }
     // The copies the sync wrote now match the refreshed team repo, so that
     // revision is a base of the next push, even when the sync stopped partway
-    // (the copies it did not reach still match an older base) and even under
-    // --dry-run (the sync has already written the files). The pull record's
+    // (the copies it did not reach still match an older base). The pull record's
     // `rev` stays, or the next pull would skip the docs and agents of this
     // revision. HOME gets a record here if it has none yet; an unrecorded
     // project checkout does not, as its fallback base may be another's.
+    //
+    // A dry run records nothing. The revision it would record describes copies
+    // it wrote into the member's tool directories — state that outlives the
+    // preview and that the real push will write for real, after its own sync
+    // (#866). Recording it here would also make the NEXT push compare against a
+    // revision this checkout never actually synced.
     const recordsBase = bases.source === 'checkout' || localConfig.scope === 'user';
-    const syncedRev = recordsBase && !teamRepoStale
+    const syncedRev = recordsBase && !teamRepoStale && !options.dryRun
       ? await getHeadCommit(localConfig.repo.localPath)
       : null;
     if (syncedRev) {

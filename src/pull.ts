@@ -79,6 +79,7 @@ const FILE_NOT_FOUND_ERROR_CODE = 'ENOENT';
  */
 async function refreshTeamRepo(
   localConfig: LocalConfig,
+  options: { dryRun?: boolean } = {},
 ): Promise<{ label: string; version: string | null; submodulesFailed: boolean; submodulesChanged: boolean }> {
   if (localConfig.repo.kind === 'http') {
     const { resolveApiKey } = await import('./api-key.js');
@@ -101,10 +102,17 @@ async function refreshTeamRepo(
     // Self-heal an older .teamai/.gitignore that still ignores `env` (pre-beta.5),
     // which would keep team env vars off main. Best-effort; prompts the user to
     // commit the change.
-    try {
-      const { migrateSelfModeGitignore } = await import('./init.js');
-      await migrateSelfModeGitignore(localConfig);
-    } catch { /* best-effort */ }
+    //
+    // A dry run skips it: it rewrites a TRACKED file in the user's active tree,
+    // which outlives the preview, and it is idempotent, so the next real pull
+    // performs it (#866). push's self-mode branch gates the identical call the
+    // same way.
+    if (!options.dryRun) {
+      try {
+        const { migrateSelfModeGitignore } = await import('./init.js');
+        await migrateSelfModeGitignore(localConfig);
+      } catch { /* best-effort */ }
+    }
 
     let version: string | null = null;
     try {
@@ -115,14 +123,65 @@ async function refreshTeamRepo(
     return { label: 'single-repo (knowledge on main)', version, submodulesFailed: false, submodulesChanged: false };
   }
 
-  // The shared team clone is mutated here (git pull + flushPendingLearnings'
-  // add/commit/push). The partition sync-lock that serializes this against a
-  // concurrent pull/push is acquired by the CALLER (pull()) and held across this
+/**
+ * Refresh a git-mode team clone's remote-tracking refs WITHOUT touching its
+ * working tree: `git fetch origin <branch>`, no pull and no reset.
+ *
+ * This is what a `--dry-run` pull uses in place of `pullRepo`. `pullRepo`
+ * fast-forwards the shared clone and, on divergence, `reset --hard`s it — writes
+ * a preview has no right to make, because the preview took no lock: a concurrent
+ * push that took the lock moments after the preview called it free may have a
+ * transient branch checked out right now (#866). Fetching moves only the
+ * remote-tracking refs, so the preview still names the destination a real pull
+ * would sync from.
+ *
+ * Returns the same one-line label shape `pullRepo` does, so the caller's report
+ * reads the same either way.
+ */
+async function fetchTeamRepoReadOnly(localPath: string): Promise<string> {
+  const git = createGit(localPath);
+  const branch = (await git.revparse(['--abbrev-ref', 'HEAD'])).trim();
+  await git.fetch(['origin', branch]);
+  return 'fetched (dry run — clone left as it is)';
+}
+
+/**
+ * Pull the team repo up to date, or — under a dry run — refresh its
+ * remote-tracking refs and nothing else.
+ *
+ * The shared team clone is mutated by the real path (git pull + flushPendingLearnings'
+ * add/commit/push). The partition sync-lock that serializes this against a
+ * concurrent pull/push is acquired by the CALLER (pull()) and held across this
+ * scope's ENTIRE clone-consuming lifecycle — fetch, resource scan/deploy, and
+ * the reconcile/source/report stages — so there is no unlocked window in which
+ * another writer could reset/checkout the tree. We must NOT lock here: the lock
+ * is non-reentrant, so re-acquiring it in the same process would fail.
+ *
+ * A dry run does NOT pull. `pullRepo` fast-forwards the shared clone and, on
+ * divergence, `reset --hard`s it — a preview that takes no lock has no right to
+ * either, and a concurrent push that took the lock a moment after the preview
+ * called it free could have a transient branch checked out right now (#866).
+ * It fetches instead, which moves the remote-tracking refs and nothing else, so
+ * the preview still names the destination a real pull would sync from.
+ *
+ * `submodulesChanged` marks a run whose submodule update succeeded but moved the
+ * tree on disk: the caller must then NOT take that same fast path *this* run,
+ * because the parent rev alone cannot see the change (issue #525).
+ */
   // scope's ENTIRE clone-consuming lifecycle — fetch, resource scan/deploy, and
   // the reconcile/source/report stages — so there is no unlocked window in which
   // another writer could reset/checkout the tree. We must NOT lock here: the lock
   // is non-reentrant, so re-acquiring it in the same process would fail.
-  const result = await pullRepo(localConfig.repo.localPath);
+  //
+  // A dry run does NOT pull. `pullRepo` fast-forwards the shared clone and, on
+  // divergence, `reset --hard`s it — a preview that takes no lock has no right to
+  // either, and a concurrent push that took the lock a moment after the preview
+  // called it free could have a transient branch checked out right now (#866).
+  // It fetches instead, which moves the remote-tracking refs and nothing else, so
+  // the preview still names the destination a real pull would sync from.
+  const result = options.dryRun
+    ? await fetchTeamRepoReadOnly(localConfig.repo.localPath)
+    : await pullRepo(localConfig.repo.localPath);
 
   let version: string | null = null;
   try {
@@ -709,7 +768,7 @@ async function pullForScope(
   // unchanged-rev fast path for THIS run — the parent rev cannot see it (#525).
   let submodulesChanged = false;
   try {
-    const refresh = await refreshTeamRepo(localConfig);
+    const refresh = await refreshTeamRepo(localConfig, options);
     currentRev = refresh.version;
     submodulesFailed = refresh.submodulesFailed;
     submodulesChanged = refresh.submodulesChanged;
@@ -751,8 +810,13 @@ async function pullForScope(
   // pull will retry, and that has to hold in every mode. pull() holds the
   // partition sync lock across this scope and the lock is not reentrant, so
   // publishing must not try to take it again. Never let it block the pull.
+  // A dry run only counts the queue: publishing is a commit and a push, and the
+  // entries stay on the machine for the real pull (#866).
   try {
-    const queue = await publishQueuedLearnings(localConfig, localConfig.username, { holdsSyncLock: true });
+    const queue = await publishQueuedLearnings(localConfig, localConfig.username, {
+      holdsSyncLock: true,
+      ...(options.dryRun ? { dryRun: true } : {}),
+    });
     if (queue.published.length > 0) {
       log.success(`Published ${queue.published.length} queued learning(s)`);
     }

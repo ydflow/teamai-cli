@@ -43,6 +43,11 @@ export interface PublishQueueReport {
    * so the learnings stay where they are, for the install they belong to.
    */
   installChanged?: string;
+  /**
+   * This was a preview: `remaining` is what the real command would publish, and
+   * nothing was committed, pushed, removed or locked.
+   */
+  dryRun?: true;
 }
 
 function commitMessageFor(username: string): string {
@@ -53,12 +58,30 @@ function commitMessageFor(username: string): string {
  * Publish everything in the queue, as one commit. Best-effort and non-blocking:
  * it never throws, and a failure leaves every entry queued for the next run
  * rather than hammering an unreachable origin.
+ *
+ * `options.dryRun` previews instead of publishing: the queue is counted and
+ * reported, and nothing is committed, pushed, removed or locked. A preview must
+ * not take the queue lock either — `acquireLock` creates the lock's parent,
+ * which on a fresh install is a directory the preview has no reason to leave
+ * behind (#866).
  */
 export async function publishQueuedLearnings(
   localConfig: LocalConfig,
   username: string,
-  options: { holdsSyncLock?: boolean } = {},
+  options: { holdsSyncLock?: boolean; dryRun?: boolean } = {},
 ): Promise<PublishQueueReport> {
+  // Counted without the queue lock: `listPendingLearnings` is a directory
+  // listing, and a preview must not create the lock's parent directory.
+  const queued = await listPendingLearnings(localConfig);
+  if (queued.length === 0) {
+    return { published: [], remaining: 0 };
+  }
+  if (options.dryRun) {
+    // The count is what the caller reports. The entries stay queued and stay on
+    // the machine: publishing them is the real command's job.
+    return { published: [], remaining: queued.length, dryRun: true };
+  }
+
   const listing = await listPendingForInstall(localConfig);
   switch (listing.status) {
     case 'listed':
@@ -66,7 +89,7 @@ export async function publishQueuedLearnings(
     case 'busy':
       return {
         published: [],
-        remaining: (await listPendingLearnings(localConfig)).length,
+        remaining: queued.length,
         lastError: `another teamai command holds ${listing.lockPath}`,
       };
     case 'changed':
@@ -79,10 +102,6 @@ export async function publishQueuedLearnings(
       const unhandled: never = listing;
       throw new Error(`Unhandled queue listing: ${JSON.stringify(unhandled)}`);
     }
-  }
-  const queued = listing.queued;
-  if (queued.length === 0) {
-    return { published: [], remaining: 0 };
   }
 
   // Publishing writes to the team clone, which `pull` and `push` guard with the

@@ -335,24 +335,22 @@ describe('--dry-run on a fresh self-mode clone (#866)', () => {
   // Each command declares exactly which new entries it may leave behind. Both
   // start empty: the point of #866 is that a preview writes nothing.
   //
-  // `pull` is allowed one, and it is not this change's. `pull` counts the
-  // contribution queue so it can report how many learnings it would publish, and
-  // `publishQueuedLearnings` lists it through `listPendingForInstall`
-  // (`utils/pending-learnings.ts`), which holds the queue lock — `acquireLock`
-  // creates the lock's parent, so an install with no `<getTeamaiHome>/locks/`
-  // gets one and keeps it. That call is unchanged here, and identical on the
-  // base commit; it only became reachable on a fresh self-mode clone once
-  // detection stopped aborting first (#850). Declared and counted rather than
-  // filtered out, so any OTHER new entry still fails this test.
-  const PULL_LOCK_DIR = `${path.join('home', '.teamai', 'locks')}/`;
+  // Revision 5 removed the last entry this list had. `pull` used to be allowed
+  // one — `<HOME>/.teamai/locks/`, created by the queue lock
+  // `publishQueuedLearnings` took through `listPendingForInstall` — and the
+  // preview no longer takes it at all: the queue is counted by
+  // `listPendingLearnings`, an unlocked directory listing, so a preview that
+  // needs the count does not need the lock. Nothing is declared now, so ANY new
+  // entry fails these cases.
+  //
   // `git fetch` — which the preview performs on purpose, so that its plan is
   // based on the same `origin/<default>` the real push would branch from —
   // leaves its own one-line record behind. It names no ref, changes no working
-  // tree, and git overwrites it on the next fetch. Same treatment as the entry
-  // above: declared and counted, so any other new entry still fails this test.
+  // tree, and git overwrites it on the next fetch. Declared and counted, so any
+  // other new entry still fails this test.
   const FETCH_HEAD = path.join('app', '.git', 'FETCH_HEAD');
   const SELF_COMMANDS: Array<[string, () => Promise<void>, string[]]> = [
-    ['pull --dry-run', () => pull({ dryRun: true }), [PULL_LOCK_DIR]],
+    ['pull --dry-run', () => pull({ dryRun: true }), []],
     ['push --dry-run', () => push({ dryRun: true }), [FETCH_HEAD]],
   ];
 
@@ -376,4 +374,107 @@ describe('--dry-run on a fresh self-mode clone (#866)', () => {
     // A dry run may parse the remote, but nothing else may reach a provider.
     expect(providerCalls).toEqual([]);
   });
+});
+
+// ─── The four P1 findings on the current head (#866 review) ───
+// Each case here fails on the head under review, for the reason the review names.
+describe('--dry-run must not act on what it loaded (#866 review round 5)', () => {
+  const originalCwd = process.cwd();
+  let root: string;
+
+  beforeEach(() => {
+    root = fs.mkdtempSync(path.join(os.tmpdir(), 'teamai-dry-run-p1-'));
+    const home = path.join(root, 'home');
+    fs.mkdirSync(path.join(home, '.teamai'), { recursive: true });
+    fs.mkdirSync(path.join(home, '.claude'), { recursive: true });
+    vi.stubEnv('HOME', home);
+    process.chdir(setupSelfModeClone(root));
+    vi.spyOn(log, 'info').mockImplementation(() => {});
+  });
+
+  afterEach(() => {
+    vi.restoreAllMocks();
+    vi.mocked(updateReports).mockClear();
+    providerCalls.length = 0;
+    vi.unstubAllEnvs();
+    process.chdir(originalCwd);
+    fs.rmSync(root, { recursive: true, force: true });
+  });
+
+  // Finding 1. `pullForScope` publishes the contribution queue with
+  // `{ holdsSyncLock: true }` — a fact, not a preview — so a dry run reports a
+  // non-empty queue as published and removes it from the machine. The queue is
+  // counted under a lock whose creation is itself a write, so a preview must not
+  // take it: `listPendingLearnings` is an unlocked directory listing.
+  it('pull --dry-run reports the queue without publishing or locking it', async () => {
+    const queued = path.join(root, 'home', '.teamai', 'pending-learnings', 'note.md');
+    fs.mkdirSync(path.dirname(queued), { recursive: true });
+    fs.writeFileSync(queued, 'Learned: a preview must not publish.\n');
+    const locksDir = path.join(root, 'home', '.teamai', 'locks');
+    const before = snapshotTree(root);
+    const error = await pull({ dryRun: true }).then(() => null, (e: unknown) => e);
+    expect(error).toBeNull();
+    // Still queued, still on the machine.
+    expect(fs.existsSync(queued)).toBe(true);
+    // The queue lock was never taken, so its directory was never created.
+    expect(fs.existsSync(locksDir)).toBe(false);
+    const after = snapshotTree(root);
+    expect(Object.keys(after).filter((key) => !(key in before))).toEqual([]);
+  });
+
+  // Finding 3. `refreshTeamRepo` self-heals a pre-beta.5 `.teamai/.gitignore`
+  // unconditionally. push gates it on the real path (a tracked file in the
+  // user's ACTIVE tree outlives the preview); pull does not gate it at all.
+  it('pull --dry-run does not self-heal .teamai/.gitignore', async () => {
+    const gitignore = path.join(root, 'app', '.teamai', '.gitignore');
+    fs.writeFileSync(gitignore, 'env\n');
+    const before = snapshotTree(root);
+    const error = await pull({ dryRun: true }).then(() => null, (e: unknown) => e);
+    expect(error).toBeNull();
+    expect(fs.readFileSync(gitignore, 'utf-8')).toBe('env\n');
+    const after = snapshotTree(root);
+    expect(Object.keys(after).filter((key) => !(key in before))).toEqual([]);
+    for (const key of Object.keys(before)) expect(after[key]).toBe(before[key]);
+  });
+
+  // Finding 2. `acquireLock({ dryRun })` answering "would the real run have got
+  // it" is not the same as holding it: a real pull that runs concurrently may
+  // take the lock the preview just called free, and the preview then proceeds
+  // into the same clone. What the caller needs to know is the fact it reports —
+  // contended or not — not a token it never took.
+  it('a live holder is reported as contended, and the preview takes no lock', async () => {
+    const lockPath = path.join(root, 'home', '.teamai', 'projects', 'x', '.sync-lock');
+    const { acquireLock, releaseLock } = await import('../update.js');
+    // Held by "another process": the same call this process would make for real.
+    expect(await acquireLock(lockPath)).toBe(true);
+    const held = fs.readFileSync(lockPath, 'utf-8');
+    // Drop our own record of it, so what follows is only the preview's doing.
+    await releaseLock(lockPath);
+    expect(fs.existsSync(lockPath)).toBe(false);
+    // Put the other process's lock back, and keep it there for the whole case.
+    fs.mkdirSync(path.dirname(lockPath), { recursive: true });
+    fs.writeFileSync(lockPath, held);
+    const snapshot = snapshotTree(root);
+
+    // A live holder: a preview must say so, and must not touch the lock.
+    expect(await acquireLock(lockPath, { dryRun: true })).toBe(false);
+    expect(fs.readFileSync(lockPath, 'utf-8')).toBe(held);
+    // Nothing is recorded for release, so a preview cannot delete it either.
+    await releaseLock(lockPath);
+    expect(fs.readFileSync(lockPath, 'utf-8')).toBe(held);
+
+    // Once free, a preview reports uncontended — the answer a real run gets.
+    fs.rmSync(lockPath);
+    expect(await acquireLock(lockPath, { dryRun: true })).toBe(true);
+    // And it wrote nothing: no lock file, no parent directory.
+    expect(fs.existsSync(lockPath)).toBe(false);
+    expect(Object.keys(snapshotTree(root)).filter((key) => !(key in snapshot))).toEqual([]);
+  });
+
+  // Finding 4 — the pre-scan sync and the `saveStateForScope` beside it, both
+  // before `pushCore`'s own dry-run guard — needs a project-scope install with a
+  // checkout record before the write is reachable at all (`recordsBase` is
+  // `bases.source === 'checkout'`), which no fixture in this file produces.
+  // It is covered end-to-end in `e2e/push-dry-run-writes-866.test.ts`, on the
+  // shape the real command runs in.
 });
