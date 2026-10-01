@@ -1882,6 +1882,7 @@ teamai session save --push --include-prompt  # 额外带上（脱敏后的）首
 
 ```bash
 teamai hooks list      # 查看生效的内置和团队 hooks
+teamai hooks inject --dry-run # 预览，不修改工具设置或受管 hook 记录
 teamai hooks inject    # 重新注入
 teamai hooks remove    # 移除
 ```
@@ -2778,6 +2779,7 @@ teamai init --repo https://github.com/yourorg/yourrepo --force
 
 ```bash
 teamai doctor        # 诊断
+teamai hooks inject --dry-run # 先预览
 teamai hooks inject  # 重新注入
 ```
 
