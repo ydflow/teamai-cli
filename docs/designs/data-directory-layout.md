@@ -688,6 +688,7 @@ Those builds, and the reports checkout `teamai recall feedback --negative` count
 the team's upvotes from, take the votes directory from `indexableVotesDir`,
 which runs the same probe on the reports checkout: another repository's votes
 are left out, so no learning of this project carries that team's hotness.
+Negative feedback reads the team's votes without persisting a v1 → v2 upgrade there. A successful downvote is recorded in the scope's local votes and reaches the team's reports on sync.
 The recall hook's vote judge, which starts no git process, reads the same answer
 from git's files: the checkout's `.git` file names its gitdir, whose `commondir`
 leads to the owning repository's git dir, compared (realpath'd) with this
