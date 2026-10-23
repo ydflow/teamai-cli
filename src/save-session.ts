@@ -131,7 +131,12 @@ export async function saveSession(options: SaveSessionOptions): Promise<void> {
   const commitMsg = `[teamai] Session summary from ${username} (${monthKey(summary)})`;
 
   if (options.dryRun) {
-    log.info(`[dry-run] Would push session summary to sessions/${username}/${monthKey(summary)}.md`);
+    // A --dry-run load answers with the bootstrap preview for a self-mode
+    // install that has never been bootstrapped, and that preview carries no
+    // username (authentication is skipped) — show the placeholder rather than
+    // print an empty path segment (#853 review).
+    const who = username || '<username>';
+    log.info(`[dry-run] Would push session summary to sessions/${who}/${monthKey(summary)}.md`);
     return;
   }
 
